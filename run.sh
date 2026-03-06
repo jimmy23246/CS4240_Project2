@@ -1,6 +1,12 @@
 #!/bin/bash
+set -euo pipefail
 
-# Write a script to run your optimizer in this file 
-# This script should take 2 command line arguments: a path to 
-# the input ir file and a path where the output ir file should
-# be created.
+if [ $# -ne 2 ]; then
+  echo "Usage: ./run.sh <input.ir> <output.ir>" >&2
+  exit 1
+fi
+
+INPUT_IR="$1"
+OUTPUT_IR="$2"
+
+java -cp build OptimizerMain "$INPUT_IR" "$OUTPUT_IR"
