@@ -4,6 +4,10 @@ import ir.IRInstruction;
 import ir.IRPrinter;
 import ir.IRProgram;
 import ir.IRReader;
+import ir.datatype.IRArrayType;
+import ir.datatype.IRIntType;
+import ir.datatype.IRType;
+import ir.operand.IRConstantOperand;
 import ir.operand.IROperand;
 import ir.operand.IRVariableOperand;
 
@@ -11,16 +15,20 @@ import java.io.FileOutputStream;
 import java.io.PrintStream;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.BitSet;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
- * Optimizer A - Dead code elimination without reaching definitions and branch removal
- * Mark-sweep style
- * Mark all critical instruction and push to WorkList. 
- * For each used variable, mark all instructions that write to it. 
- * Delete any instruction that is not marked & deletable 
+ * Optimizer pipeline:
+ *   Pass 1: Dead Code Elimination with Reaching Definitions (Optimizer B)
+ *   Pass 2: Copy Propagation
+ *   Pass 3: Constant Folding
  */
 public class OptimizerMain {
 
@@ -42,271 +50,683 @@ public class OptimizerMain {
             throw e;
         }
 
-        // Optimize each function
         for (IRFunction f : program.functions) {
-            simpleDCE(f);
+            optimizeFunction(f);
         }
 
-        // Write optimized IR
         try (PrintStream ps = new PrintStream(new FileOutputStream(output))) {
             IRPrinter printer = new IRPrinter(ps);
             printer.printProgram(program);
         }
     }
 
-    private static void simpleDCE(IRFunction f) {
+    // =========================================================================
+    // Inner classes
+    // =========================================================================
+
+    private static class BasicBlock {
+        int id, start, end;
+        List<Integer> preds = new ArrayList<>();
+        List<Integer> succs = new ArrayList<>();
+        BitSet gen, kill, in, out;
+    }
+
+    private static class ReachingDefsResult {
+        int numDefs;
+        int[] defInst;          // defIndex -> instruction index
+        int[] instDefIdx;       // instruction index -> defIndex (-1 if not a def)
+        Map<String, List<Integer>> varDefs; // varName -> list of defIndices
+        BitSet[] reachingDefs;  // instruction index -> BitSet of reaching defs BEFORE that instruction
+        List<BasicBlock> blocks;
+    }
+
+    // =========================================================================
+    // Main optimization pipeline
+    // =========================================================================
+
+    private static void optimizeFunction(IRFunction f) {
+        reachingDefsDCE(f);
+        boolean changed = copyPropagate(f);
+        if (changed) reachingDefsDCE(f);
+        changed = constantFold(f);
+        if (changed) reachingDefsDCE(f);
+    }
+
+    // =========================================================================
+    // Pass 1: Reaching Definitions DCE
+    // =========================================================================
+
+    private static void reachingDefsDCE(IRFunction f) {
         List<IRInstruction> insts = f.instructions;
         int n = insts.size();
+
+        ReachingDefsResult rdr = computeReachingDefs(insts);
 
         boolean[] marked = new boolean[n];
         ArrayDeque<Integer> worklist = new ArrayDeque<>();
 
-        // Initialize
+        // Mark all critical instructions
         for (int i = 0; i < n; i++) {
-            IRInstruction inst = insts.get(i);
-            if (isCritical(inst)) {
+            if (isCritical(insts.get(i))) {
                 marked[i] = true;
                 worklist.addLast(i);
             }
         }
 
-        // Mark - Propagate backwards through naive "writes-to" edges without reaching defs
+        // Mark phase: for each used variable, mark only its reaching definitions
         while (!worklist.isEmpty()) {
             int i = worklist.removeFirst();
             IRInstruction inst = insts.get(i);
-
-            // collect used variables in this instruction
             Set<String> usedVars = getUsedVariableNames(inst);
 
-            // for each used variable v, mark every instruction that writes v
             for (String v : usedVars) {
-                for (int j = 0; j < n; j++) {
-                    if (!marked[j] && writesToVariable(insts.get(j), v)) {
-                        marked[j] = true;
-                        worklist.addLast(j);
+                BitSet rd = rdr.reachingDefs[i];
+                for (int d = rd.nextSetBit(0); d >= 0; d = rd.nextSetBit(d + 1)) {
+                    String defVar = getDefinedVar(insts.get(rdr.defInst[d]));
+                    if (v.equals(defVar)) {
+                        int defI = rdr.defInst[d];
+                        if (!marked[defI]) {
+                            marked[defI] = true;
+                            worklist.addLast(defI);
+                        }
                     }
+                }
+                // If no reaching def for v, it's a parameter — nothing to mark
+            }
+        }
+
+        // Sweep: remove unmarked deletable instructions
+        List<IRInstruction> newInsts = new ArrayList<>();
+        for (int i = 0; i < n; i++) {
+            if (!marked[i] && isDeletableIfUnmarked(insts.get(i))) continue;
+            newInsts.add(insts.get(i));
+        }
+        f.instructions = newInsts;
+    }
+
+    // =========================================================================
+    // Pass 2: Copy Propagation
+    // =========================================================================
+
+    private static boolean copyPropagate(IRFunction f) {
+        List<IRInstruction> insts = f.instructions;
+        boolean anyChanged = false;
+
+        ReachingDefsResult rdr = computeReachingDefs(insts);
+
+        for (int copyIdx = 0; copyIdx < insts.size(); copyIdx++) {
+            IRInstruction copyInst = insts.get(copyIdx);
+            if (copyInst.opCode != IRInstruction.OpCode.ASSIGN) continue;
+            if (copyInst.operands == null || copyInst.operands.length != 2) continue;
+            if (!(copyInst.operands[0] instanceof IRVariableOperand)) continue;
+            if (!(copyInst.operands[1] instanceof IRVariableOperand)) continue;
+
+            IRVariableOperand dstOp = (IRVariableOperand) copyInst.operands[0];
+            IRVariableOperand srcOp = (IRVariableOperand) copyInst.operands[1];
+
+            // Skip array types
+            if (dstOp.type instanceof IRArrayType || srcOp.type instanceof IRArrayType) continue;
+
+            String dst = dstOp.getName();
+            String src = srcOp.getName();
+            if (dst.equals(src)) continue; // trivial copy
+
+            int copyDefIdx = rdr.instDefIdx[copyIdx];
+            if (copyDefIdx < 0) continue;
+
+            // Collect src defs reaching the copy point
+            List<Integer> srcDefList = rdr.varDefs.getOrDefault(src, Collections.emptyList());
+            BitSet srcDefsAtCopy = new BitSet();
+            for (int d : srcDefList) {
+                if (rdr.reachingDefs[copyIdx].get(d)) {
+                    srcDefsAtCopy.set(d);
+                }
+            }
+
+            // For each instruction that uses dst, try to propagate
+            for (int i = 0; i < insts.size(); i++) {
+                if (i == copyIdx) continue;
+                IRInstruction inst = insts.get(i);
+                Set<String> used = getUsedVariableNames(inst);
+                if (!used.contains(dst)) continue;
+
+                // The copy must be the UNIQUE reaching definition of dst at this use
+                List<Integer> dstDefList = rdr.varDefs.getOrDefault(dst, Collections.emptyList());
+                int dstDefsAtI = 0;
+                for (int d : dstDefList) {
+                    if (rdr.reachingDefs[i].get(d)) dstDefsAtI++;
+                }
+                if (dstDefsAtI != 1) continue;
+                if (!rdr.reachingDefs[i].get(copyDefIdx)) continue;
+
+                // src must not have been redefined between the copy and this use:
+                // the src defs reaching i must equal those reaching the copy
+                BitSet srcDefsAtI = new BitSet();
+                for (int d : srcDefList) {
+                    if (rdr.reachingDefs[i].get(d)) {
+                        srcDefsAtI.set(d);
+                    }
+                }
+                if (!srcDefsAtCopy.equals(srcDefsAtI)) continue;
+
+                // Safe to propagate: replace uses of dst with src at instruction i
+                replaceUseOfVar(inst, dst, src, srcOp.type);
+                anyChanged = true;
+            }
+        }
+
+        return anyChanged;
+    }
+
+    private static void replaceUseOfVar(IRInstruction inst, String oldName, String newName, IRType newType) {
+        IRInstruction.OpCode op = inst.opCode;
+        IROperand[] ops = inst.operands;
+        if (ops == null) return;
+
+        switch (op) {
+            case ASSIGN:
+                if (ops.length == 2) {
+                    // ops[0] = dst (def), ops[1] = src (use)
+                    replaceAt(inst, ops, 1, oldName, newName, newType);
+                } else if (ops.length == 3) {
+                    // array write: ops[0]=array, ops[1]=idx(use), ops[2]=val(use)
+                    replaceAt(inst, ops, 1, oldName, newName, newType);
+                    replaceAt(inst, ops, 2, oldName, newName, newType);
+                }
+                break;
+            case ADD: case SUB: case MULT: case DIV: case AND: case OR:
+                // ops[0] = dst (def), ops[1] and ops[2] = uses
+                replaceAt(inst, ops, 1, oldName, newName, newType);
+                replaceAt(inst, ops, 2, oldName, newName, newType);
+                break;
+            case BREQ: case BRNEQ: case BRLT: case BRGT: case BRGEQ:
+                // ops[0] = label, ops[1] and ops[2] = uses
+                replaceAt(inst, ops, 1, oldName, newName, newType);
+                replaceAt(inst, ops, 2, oldName, newName, newType);
+                break;
+            case RETURN:
+                replaceAt(inst, ops, 0, oldName, newName, newType);
+                break;
+            case CALL:
+                // ops[0] = func name, ops[1..] = args
+                for (int i = 1; i < ops.length; i++) {
+                    replaceAt(inst, ops, i, oldName, newName, newType);
+                }
+                break;
+            case CALLR:
+                // ops[0] = ret (def), ops[1] = func name, ops[2..] = args
+                for (int i = 2; i < ops.length; i++) {
+                    replaceAt(inst, ops, i, oldName, newName, newType);
+                }
+                break;
+            case ARRAY_STORE:
+                // array_store val, A, idx — ops[0]=val(use), ops[1]=array, ops[2]=idx(use)
+                replaceAt(inst, ops, 0, oldName, newName, newType);
+                replaceAt(inst, ops, 2, oldName, newName, newType);
+                break;
+            case ARRAY_LOAD:
+                // array_load dst, A, idx — ops[0]=dst(def), ops[1]=array, ops[2]=idx(use)
+                replaceAt(inst, ops, 2, oldName, newName, newType);
+                break;
+            default:
+                break;
+        }
+    }
+
+    private static void replaceAt(IRInstruction inst, IROperand[] ops, int idx,
+                                   String oldName, String newName, IRType newType) {
+        if (idx >= ops.length) return;
+        if (ops[idx] instanceof IRVariableOperand) {
+            IRVariableOperand v = (IRVariableOperand) ops[idx];
+            if (v.getName().equals(oldName)) {
+                ops[idx] = new IRVariableOperand(newType, newName, inst);
+            }
+        }
+    }
+
+    // =========================================================================
+    // Pass 3: Constant Folding
+    // =========================================================================
+
+    private static boolean constantFold(IRFunction f) {
+        List<IRInstruction> insts = f.instructions;
+        boolean anyChanged = false;
+
+        for (int i = 0; i < insts.size(); i++) {
+            IRInstruction inst = insts.get(i);
+            IRInstruction.OpCode op = inst.opCode;
+            IROperand[] ops = inst.operands;
+
+            if (ops == null || ops.length < 3) continue;
+            if (!(ops[0] instanceof IRVariableOperand)) continue;
+            if (!(ops[1] instanceof IRConstantOperand)) continue;
+            if (!(ops[2] instanceof IRConstantOperand)) continue;
+
+            boolean isBinArith = op == IRInstruction.OpCode.ADD
+                    || op == IRInstruction.OpCode.SUB
+                    || op == IRInstruction.OpCode.MULT
+                    || op == IRInstruction.OpCode.DIV
+                    || op == IRInstruction.OpCode.AND
+                    || op == IRInstruction.OpCode.OR;
+            if (!isBinArith) continue;
+
+            IRConstantOperand c1 = (IRConstantOperand) ops[1];
+            IRConstantOperand c2 = (IRConstantOperand) ops[2];
+            IRVariableOperand dst = (IRVariableOperand) ops[0];
+
+            // Only fold integers to avoid float formatting issues
+            if (!(c1.type instanceof IRIntType) || !(c2.type instanceof IRIntType)) continue;
+
+            long v1, v2;
+            try {
+                v1 = Long.parseLong(c1.getValueString());
+                v2 = Long.parseLong(c2.getValueString());
+            } catch (NumberFormatException e) {
+                continue;
+            }
+
+            long result;
+            switch (op) {
+                case ADD:  result = v1 + v2; break;
+                case SUB:  result = v1 - v2; break;
+                case MULT: result = v1 * v2; break;
+                case DIV:
+                    if (v2 == 0) continue;
+                    result = v1 / v2;
+                    break;
+                case AND: result = (v1 != 0 && v2 != 0) ? 1 : 0; break;
+                case OR:  result = (v1 != 0 || v2 != 0) ? 1 : 0; break;
+                default: continue;
+            }
+
+            // Replace with: assign dst, result_constant
+            IRInstruction newInst = new IRInstruction();
+            newInst.opCode = IRInstruction.OpCode.ASSIGN;
+            newInst.irLineNumber = inst.irLineNumber;
+            IRVariableOperand dstNew = new IRVariableOperand(dst.type, dst.getName(), newInst);
+            IRConstantOperand resultOp = new IRConstantOperand(IRIntType.get(), String.valueOf(result), newInst);
+            newInst.operands = new IROperand[]{dstNew, resultOp};
+            insts.set(i, newInst);
+            anyChanged = true;
+        }
+
+        return anyChanged;
+    }
+
+    // =========================================================================
+    // Reaching definitions computation
+    // =========================================================================
+
+    private static ReachingDefsResult computeReachingDefs(List<IRInstruction> insts) {
+        int n = insts.size();
+
+        // Step 1: Collect definitions
+        int[] instDefIdx = new int[n];
+        Arrays.fill(instDefIdx, -1);
+        Map<String, List<Integer>> varDefs = new HashMap<>();
+        List<Integer> defInstList = new ArrayList<>();
+
+        int numDefs = 0;
+        for (int i = 0; i < n; i++) {
+            String defVar = getDefinedVar(insts.get(i));
+            if (defVar != null) {
+                instDefIdx[i] = numDefs;
+                defInstList.add(i);
+                varDefs.computeIfAbsent(defVar, k -> new ArrayList<>()).add(numDefs);
+                numDefs++;
+            }
+        }
+
+        int[] defInst = new int[numDefs];
+        for (int d = 0; d < numDefs; d++) {
+            defInst[d] = defInstList.get(d);
+        }
+
+        // Step 2: Build CFG
+        // Identify leaders
+        boolean[] isLeader = new boolean[n];
+        if (n > 0) isLeader[0] = true;
+
+        for (int i = 0; i < n; i++) {
+            IRInstruction.OpCode op = insts.get(i).opCode;
+            if (op == IRInstruction.OpCode.LABEL) {
+                isLeader[i] = true;
+            }
+            boolean isTerminator = op == IRInstruction.OpCode.GOTO
+                    || op == IRInstruction.OpCode.BREQ  || op == IRInstruction.OpCode.BRNEQ
+                    || op == IRInstruction.OpCode.BRLT  || op == IRInstruction.OpCode.BRGT
+                    || op == IRInstruction.OpCode.BRGEQ || op == IRInstruction.OpCode.RETURN;
+            if (isTerminator && i + 1 < n) {
+                isLeader[i + 1] = true;
+            }
+        }
+
+        // Build basic blocks
+        List<BasicBlock> blocks = new ArrayList<>();
+        Map<String, Integer> labelToBlock = new HashMap<>();
+
+        int blockStart = -1;
+        for (int i = 0; i < n; i++) {
+            if (isLeader[i]) {
+                if (blockStart >= 0) {
+                    BasicBlock bb = new BasicBlock();
+                    bb.id = blocks.size();
+                    bb.start = blockStart;
+                    bb.end = i - 1;
+                    blocks.add(bb);
+                }
+                blockStart = i;
+            }
+        }
+        if (blockStart >= 0 && n > 0) {
+            BasicBlock bb = new BasicBlock();
+            bb.id = blocks.size();
+            bb.start = blockStart;
+            bb.end = n - 1;
+            blocks.add(bb);
+        }
+
+        // Map label names to block ids
+        for (BasicBlock bb : blocks) {
+            IRInstruction first = insts.get(bb.start);
+            if (first.opCode == IRInstruction.OpCode.LABEL
+                    && first.operands != null && first.operands.length > 0) {
+                labelToBlock.put(first.operands[0].toString(), bb.id);
+            }
+        }
+
+        // Build successors and predecessors
+        for (BasicBlock bb : blocks) {
+            IRInstruction last = insts.get(bb.end);
+            IRInstruction.OpCode op = last.opCode;
+            IROperand[] ops = last.operands;
+
+            if (op == IRInstruction.OpCode.GOTO) {
+                if (ops != null && ops.length > 0) {
+                    Integer target = labelToBlock.get(ops[0].toString());
+                    if (target != null) {
+                        bb.succs.add(target);
+                        blocks.get(target).preds.add(bb.id);
+                    }
+                }
+            } else if (op == IRInstruction.OpCode.BREQ  || op == IRInstruction.OpCode.BRNEQ
+                    || op == IRInstruction.OpCode.BRLT  || op == IRInstruction.OpCode.BRGT
+                    || op == IRInstruction.OpCode.BRGEQ) {
+                // branch target
+                if (ops != null && ops.length > 0) {
+                    Integer target = labelToBlock.get(ops[0].toString());
+                    if (target != null) {
+                        bb.succs.add(target);
+                        blocks.get(target).preds.add(bb.id);
+                    }
+                }
+                // fall-through
+                if (bb.id + 1 < blocks.size()) {
+                    bb.succs.add(bb.id + 1);
+                    blocks.get(bb.id + 1).preds.add(bb.id);
+                }
+            } else if (op == IRInstruction.OpCode.RETURN) {
+                // no successors
+            } else {
+                // fall-through
+                if (bb.id + 1 < blocks.size()) {
+                    bb.succs.add(bb.id + 1);
+                    blocks.get(bb.id + 1).preds.add(bb.id);
                 }
             }
         }
 
-        // Sweep - delete unmarked deletable instructions
-        List<IRInstruction> newInsts = new ArrayList<>();
-        for (int i = 0; i < n; i++) {
-            IRInstruction inst = insts.get(i);
+        // Step 3: Compute GEN and KILL per block
+        for (BasicBlock bb : blocks) {
+            bb.gen  = new BitSet(numDefs);
+            bb.kill = new BitSet(numDefs);
+            bb.in   = new BitSet(numDefs);
+            bb.out  = new BitSet(numDefs);
 
-            if (!marked[i] && isDeletableIfUnmarked(inst)) {
-                // delete it
-                continue;
+            // Collect all defs in this block, grouped by variable
+            Map<String, List<Integer>> blockVarDefs = new HashMap<>();
+            for (int i = bb.start; i <= bb.end; i++) {
+                int d = instDefIdx[i];
+                if (d < 0) continue;
+                String v = getDefinedVar(insts.get(i));
+                blockVarDefs.computeIfAbsent(v, k -> new ArrayList<>()).add(d);
             }
-            newInsts.add(inst);
+
+            // KILL[B] = all defs of variables defined in B, that are NOT in B
+            for (String v : blockVarDefs.keySet()) {
+                List<Integer> allDefsOfV   = varDefs.getOrDefault(v, Collections.emptyList());
+                List<Integer> blockDefsOfV = blockVarDefs.get(v);
+                for (int d : allDefsOfV) {
+                    if (!blockDefsOfV.contains(d)) {
+                        bb.kill.set(d);
+                    }
+                }
+            }
+
+            // GEN[B]: forward scan — last def per variable survives
+            for (int i = bb.start; i <= bb.end; i++) {
+                int d = instDefIdx[i];
+                if (d < 0) continue;
+                String v = getDefinedVar(insts.get(i));
+                // Clear all defs of same var that were previously added to gen
+                List<Integer> allDefsOfV = varDefs.getOrDefault(v, Collections.emptyList());
+                for (int od : allDefsOfV) {
+                    bb.gen.clear(od);
+                }
+                bb.gen.set(d);
+            }
         }
 
-        f.instructions = newInsts;
+        // Step 4: Iterative dataflow until fixed point
+        // IN[B]  = union of OUT[pred]
+        // OUT[B] = GEN[B] | (IN[B] & ~KILL[B])
+        boolean changed = true;
+        while (changed) {
+            changed = false;
+            for (BasicBlock bb : blocks) {
+                BitSet newIn = new BitSet(numDefs);
+                for (int predId : bb.preds) {
+                    newIn.or(blocks.get(predId).out);
+                }
+
+                BitSet newOut = (BitSet) newIn.clone();
+                newOut.andNot(bb.kill);
+                newOut.or(bb.gen);
+
+                if (!newOut.equals(bb.out) || !newIn.equals(bb.in)) {
+                    bb.in  = newIn;
+                    bb.out = newOut;
+                    changed = true;
+                }
+            }
+        }
+
+        // Step 5: Per-instruction reaching defs
+        // reachingDefs[i] = set of defs reaching BEFORE instruction i executes
+        BitSet[] reachingDefs = new BitSet[n];
+        for (BasicBlock bb : blocks) {
+            BitSet running = (BitSet) bb.in.clone();
+            for (int i = bb.start; i <= bb.end; i++) {
+                reachingDefs[i] = (BitSet) running.clone();
+
+                int d = instDefIdx[i];
+                if (d >= 0) {
+                    String v = getDefinedVar(insts.get(i));
+                    List<Integer> allDefsOfV = varDefs.getOrDefault(v, Collections.emptyList());
+                    for (int od : allDefsOfV) {
+                        running.clear(od);
+                    }
+                    running.set(d);
+                }
+            }
+        }
+
+        // Fill any unset slots (shouldn't happen in a valid CFG)
+        for (int i = 0; i < n; i++) {
+            if (reachingDefs[i] == null) reachingDefs[i] = new BitSet(numDefs);
+        }
+
+        ReachingDefsResult result = new ReachingDefsResult();
+        result.numDefs      = numDefs;
+        result.defInst      = defInst;
+        result.instDefIdx   = instDefIdx;
+        result.varDefs      = varDefs;
+        result.reachingDefs = reachingDefs;
+        result.blocks       = blocks;
+        return result;
     }
 
-    // -------- Critical definition --------
+    // =========================================================================
+    // Helpers
+    // =========================================================================
+
+    /** Returns the name of the scalar variable defined by this instruction, or null. */
+    private static String getDefinedVar(IRInstruction inst) {
+        IRInstruction.OpCode op = inst.opCode;
+        IROperand[] ops = inst.operands;
+        if (ops == null || ops.length == 0) return null;
+
+        switch (op) {
+            case ASSIGN:
+                // scalar assign (2 ops): ops[0] is the destination
+                if (ops.length == 2 && ops[0] instanceof IRVariableOperand) {
+                    return ((IRVariableOperand) ops[0]).getName();
+                }
+                return null;
+            case ADD: case SUB: case MULT: case DIV: case AND: case OR:
+            case ARRAY_LOAD:
+                if (ops[0] instanceof IRVariableOperand) {
+                    return ((IRVariableOperand) ops[0]).getName();
+                }
+                return null;
+            case CALLR:
+                if (ops[0] instanceof IRVariableOperand) {
+                    return ((IRVariableOperand) ops[0]).getName();
+                }
+                return null;
+            default:
+                return null;
+        }
+    }
+
+    /** Returns true if the instruction must always be kept (side effects / control flow). */
     private static boolean isCritical(IRInstruction inst) {
         IRInstruction.OpCode op = inst.opCode;
-
-        // Control flow / structural
-        if (op == IRInstruction.OpCode.LABEL) return true;
-        if (op == IRInstruction.OpCode.GOTO) return true;
-        if (op == IRInstruction.OpCode.BREQ) return true;
-        if (op == IRInstruction.OpCode.BRNEQ) return true;
-        if (op == IRInstruction.OpCode.BRLT) return true;
-        if (op == IRInstruction.OpCode.BRGT) return true;
-        if (op == IRInstruction.OpCode.BRGEQ) return true;
-
-        // Return
+        if (op == IRInstruction.OpCode.LABEL)  return true;
+        if (op == IRInstruction.OpCode.GOTO)   return true;
+        if (op == IRInstruction.OpCode.BREQ)   return true;
+        if (op == IRInstruction.OpCode.BRNEQ)  return true;
+        if (op == IRInstruction.OpCode.BRLT)   return true;
+        if (op == IRInstruction.OpCode.BRGT)   return true;
+        if (op == IRInstruction.OpCode.BRGEQ)  return true;
         if (op == IRInstruction.OpCode.RETURN) return true;
-
-        // Calls
-        if (op == IRInstruction.OpCode.CALL) return true;
-        if (op == IRInstruction.OpCode.CALLR) return true;
-
-        // Store
+        if (op == IRInstruction.OpCode.CALL)   return true;
+        if (op == IRInstruction.OpCode.CALLR)  return true;
         if (op == IRInstruction.OpCode.ARRAY_STORE) return true;
-
-        // ASSIGN has two forms in this codebase:
-        //  - scalar: assign, dst, src (2 operands)
-        //  - array write: assign, A, idx, val (3 operands)  -> side effect, must keep
         if (op == IRInstruction.OpCode.ASSIGN) {
-            if (inst.operands != null && inst.operands.length == 3) {
-                return true; // array element write
-            }
+            // 3-operand form is an array element write — side effect
+            if (inst.operands != null && inst.operands.length == 3) return true;
         }
-
-        // Everything else is non-critical by default
         return false;
     }
 
-    // -------- Used variables -------
+    /** Returns the set of variable names used (read) by this instruction. */
     private static Set<String> getUsedVariableNames(IRInstruction inst) {
         Set<String> used = new HashSet<>();
         IRInstruction.OpCode op = inst.opCode;
         IROperand[] ops = inst.operands;
-
         if (ops == null) return used;
 
         switch (op) {
-            case ASSIGN: {
+            case ASSIGN:
                 if (ops.length == 2) {
-                    // assign dst, src  => uses src
-                    if (ops[1] instanceof IRVariableOperand) {
+                    if (ops[1] instanceof IRVariableOperand)
                         used.add(((IRVariableOperand) ops[1]).getName());
-                    }
                 } else if (ops.length == 3) {
-                    // assign A, idx, val
-                    // uses idx, val (A is an array variable but has no instruction-writers)
-                    if (ops[1] instanceof IRVariableOperand) {
+                    if (ops[1] instanceof IRVariableOperand)
                         used.add(((IRVariableOperand) ops[1]).getName());
-                    }
-                    if (ops[2] instanceof IRVariableOperand) {
+                    if (ops[2] instanceof IRVariableOperand)
                         used.add(((IRVariableOperand) ops[2]).getName());
-                    }
                 }
                 break;
-            }
-            case ADD:
-            case SUB:
-            case MULT:
-            case DIV:
-            case AND:
-            case OR: {
-                // op dst, a, b => uses a,b
+            case ADD: case SUB: case MULT: case DIV: case AND: case OR:
                 if (ops.length >= 3) {
-                    if (ops[1] instanceof IRVariableOperand) used.add(((IRVariableOperand) ops[1]).getName());
-                    if (ops[2] instanceof IRVariableOperand) used.add(((IRVariableOperand) ops[2]).getName());
+                    if (ops[1] instanceof IRVariableOperand)
+                        used.add(((IRVariableOperand) ops[1]).getName());
+                    if (ops[2] instanceof IRVariableOperand)
+                        used.add(((IRVariableOperand) ops[2]).getName());
                 }
                 break;
-            }
-            case BREQ:
-            case BRNEQ:
-            case BRLT:
-            case BRGT:
-            case BRGEQ: {
-                // brXX label, x, y => uses x,y (label ignored)
+            case BREQ: case BRNEQ: case BRLT: case BRGT: case BRGEQ:
                 if (ops.length >= 3) {
-                    if (ops[1] instanceof IRVariableOperand) used.add(((IRVariableOperand) ops[1]).getName());
-                    if (ops[2] instanceof IRVariableOperand) used.add(((IRVariableOperand) ops[2]).getName());
+                    if (ops[1] instanceof IRVariableOperand)
+                        used.add(((IRVariableOperand) ops[1]).getName());
+                    if (ops[2] instanceof IRVariableOperand)
+                        used.add(((IRVariableOperand) ops[2]).getName());
                 }
                 break;
-            }
-            case RETURN: {
-                // return v => uses v
-                if (ops.length >= 1 && ops[0] instanceof IRVariableOperand) {
+            case RETURN:
+                if (ops.length >= 1 && ops[0] instanceof IRVariableOperand)
                     used.add(((IRVariableOperand) ops[0]).getName());
-                }
                 break;
-            }
-            case CALL: {
-                // call func, arg1, arg2, ... => uses args
+            case CALL:
                 for (int i = 1; i < ops.length; i++) {
-                    if (ops[i] instanceof IRVariableOperand) used.add(((IRVariableOperand) ops[i]).getName());
+                    if (ops[i] instanceof IRVariableOperand)
+                        used.add(((IRVariableOperand) ops[i]).getName());
                 }
                 break;
-            }
-            case CALLR: {
-                // callr ret, func, arg1, arg2, ... => uses args (ret is def)
+            case CALLR:
                 for (int i = 2; i < ops.length; i++) {
-                    if (ops[i] instanceof IRVariableOperand) used.add(((IRVariableOperand) ops[i]).getName());
+                    if (ops[i] instanceof IRVariableOperand)
+                        used.add(((IRVariableOperand) ops[i]).getName());
                 }
                 break;
-            }
-            case ARRAY_STORE: {
-                // array_store val, A, idx => uses val, idx (A ignored)
+            case ARRAY_STORE:
+                // array_store val, A, idx — uses val and idx
                 if (ops.length >= 3) {
-                    if (ops[0] instanceof IRVariableOperand) used.add(((IRVariableOperand) ops[0]).getName());
-                    if (ops[2] instanceof IRVariableOperand) used.add(((IRVariableOperand) ops[2]).getName());
+                    if (ops[0] instanceof IRVariableOperand)
+                        used.add(((IRVariableOperand) ops[0]).getName());
+                    if (ops[2] instanceof IRVariableOperand)
+                        used.add(((IRVariableOperand) ops[2]).getName());
                 }
                 break;
-            }
-            case ARRAY_LOAD: {
-                // array_load dst, A, idx => uses idx (A ignored), dst is def
+            case ARRAY_LOAD:
+                // array_load dst, A, idx — uses idx only
                 if (ops.length >= 3) {
-                    if (ops[2] instanceof IRVariableOperand) used.add(((IRVariableOperand) ops[2]).getName());
+                    if (ops[2] instanceof IRVariableOperand)
+                        used.add(((IRVariableOperand) ops[2]).getName());
                 }
                 break;
-            }
             default:
-                // LABEL/GOTO etc: no uses we care about
                 break;
         }
-
         return used;
     }
 
-    // -------- "writes-to" predicate --------
-    private static boolean writesToVariable(IRInstruction inst, String varName) {
-        IRInstruction.OpCode op = inst.opCode;
-        IROperand[] ops = inst.operands;
-        if (ops == null || ops.length == 0) return false;
-
-        switch (op) {
-            case ASSIGN: {
-                // scalar assign: assign dst, src writes dst
-                if (ops.length == 2 && ops[0] instanceof IRVariableOperand) {
-                    return ((IRVariableOperand) ops[0]).getName().equals(varName);
-                }
-                // array assign (3 operands) is memory write
-                return false;
-            }
-            case ADD:
-            case SUB:
-            case MULT:
-            case DIV:
-            case AND:
-            case OR:
-            case ARRAY_LOAD: {
-                // op dst, ... writes dst
-                if (ops[0] instanceof IRVariableOperand) {
-                    return ((IRVariableOperand) ops[0]).getName().equals(varName);
-                }
-                return false;
-            }
-            case CALLR: {
-                // callr ret, func, ... writes ret
-                if (ops[0] instanceof IRVariableOperand) {
-                    return ((IRVariableOperand) ops[0]).getName().equals(varName);
-                }
-                return false;
-            }
-            default:
-                return false;
-        }
-    }
-
-    // -------- What we are allowed to delete if not marked --------
+    /** Returns true if an unmarked instruction may be safely deleted. */
     private static boolean isDeletableIfUnmarked(IRInstruction inst) {
         IRInstruction.OpCode op = inst.opCode;
-
-        // Control flow / Side-effect ops
-        if (op == IRInstruction.OpCode.LABEL) return false;
-        if (op == IRInstruction.OpCode.GOTO) return false;
-        if (op == IRInstruction.OpCode.BREQ) return false;
-        if (op == IRInstruction.OpCode.BRNEQ) return false;
-        if (op == IRInstruction.OpCode.BRLT) return false;
-        if (op == IRInstruction.OpCode.BRGT) return false;
-        if (op == IRInstruction.OpCode.BRGEQ) return false;
+        if (op == IRInstruction.OpCode.LABEL)  return false;
+        if (op == IRInstruction.OpCode.GOTO)   return false;
+        if (op == IRInstruction.OpCode.BREQ)   return false;
+        if (op == IRInstruction.OpCode.BRNEQ)  return false;
+        if (op == IRInstruction.OpCode.BRLT)   return false;
+        if (op == IRInstruction.OpCode.BRGT)   return false;
+        if (op == IRInstruction.OpCode.BRGEQ)  return false;
         if (op == IRInstruction.OpCode.RETURN) return false;
-        if (op == IRInstruction.OpCode.CALL) return false;
-        if (op == IRInstruction.OpCode.CALLR) return false;
+        if (op == IRInstruction.OpCode.CALL)   return false;
+        if (op == IRInstruction.OpCode.CALLR)  return false;
         if (op == IRInstruction.OpCode.ARRAY_STORE) return false;
-
-        // Scalar form
         if (op == IRInstruction.OpCode.ASSIGN) {
             return inst.operands != null && inst.operands.length == 2;
         }
-
-        // Pure computations/load can be delete
-        if (op == IRInstruction.OpCode.ADD) return true;
-        if (op == IRInstruction.OpCode.SUB) return true;
-        if (op == IRInstruction.OpCode.MULT) return true;
-        if (op == IRInstruction.OpCode.DIV) return true;
-        if (op == IRInstruction.OpCode.AND) return true;
-        if (op == IRInstruction.OpCode.OR) return true;
+        if (op == IRInstruction.OpCode.ADD)   return true;
+        if (op == IRInstruction.OpCode.SUB)   return true;
+        if (op == IRInstruction.OpCode.MULT)  return true;
+        if (op == IRInstruction.OpCode.DIV)   return true;
+        if (op == IRInstruction.OpCode.AND)   return true;
+        if (op == IRInstruction.OpCode.OR)    return true;
         if (op == IRInstruction.OpCode.ARRAY_LOAD) return true;
-
         return false;
     }
 }
