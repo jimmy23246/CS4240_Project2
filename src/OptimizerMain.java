@@ -24,17 +24,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/**
- * Optimizer pipeline:
- *   dead code elimination with reaching definitions
- *   copy propagation
- *   constant folding
- */
+// Optimizer
+// Dead Code Elimination + Copy Propagation + Constant Folding
 public class OptimizerMain {
 
     public static void main(String[] args) throws Exception {
         if (args.length != 2) {
-            System.err.println("Usage: java OptimizerMain <input.ir> <output.ir>");
+            System.err.println("Invalid arguments. Need <input.ir> <output.ir>");
             System.exit(1);
         }
 
@@ -43,11 +39,12 @@ public class OptimizerMain {
 
         IRReader reader = new IRReader();
         IRProgram program;
+        
         try {
             program = reader.parseIRFile(input);
-        } catch (IRException e) {
-            System.err.println("IR parse error: " + e.getMessage());
-            throw e;
+        } catch (IRException exception) {
+            System.err.println("IR ERROR:" + exception.getMessage());
+            throw exception;
         }
 
         for (IRFunction f : program.functions) {
@@ -60,6 +57,8 @@ public class OptimizerMain {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Basic Block and Reaching Definition data structures
     private static class BasicBlock {
         int id, start, end;
         List<Integer> preds = new ArrayList<>();
@@ -68,11 +67,11 @@ public class OptimizerMain {
     }
 
     private static class ReachingDefsResult {
-        int numDefs;
-        int[] defInst;          // defIndex -> instruction index
-        int[] instDefIdx;       // instruction index -> defIndex (-1 if not a def)
-        Map<String, List<Integer>> varDefs; // list of defIndices
-        BitSet[] reachingDefs;  // bitset of reaching defs before that instruction
+        int numDef;
+        int[] defInst;                              // defIndex -> instruction index
+        int[] instDefIdx;                           // instruction index -> defIndex (-1 if not a def)
+        Map<String, List<Integer>> varDefs;         // varName -> list of defIndices
+        BitSet[] reachingDefs;                      // instruction index -> BitSet of reaching defs BEFORE that instruction
         List<BasicBlock> blocks;
     }
 
@@ -91,7 +90,8 @@ public class OptimizerMain {
         }
     }
 
-    // deadcode elimination
+    // --------------------------------------------------------------------------
+    // Deadcode Elimination
     private static void deadcodeElimination(IRFunction function) {
         List<IRInstruction> insts = function.instructions;
         int n = insts.size();
@@ -101,7 +101,7 @@ public class OptimizerMain {
         boolean[] marked = new boolean[n];
         ArrayDeque<Integer> worklist = new ArrayDeque<>();
 
-        // markcritical instructions
+        // Find critical instruction
         for (int i = 0; i < n; i++) {
             if (isCritical(insts.get(i))) {
                 marked[i] = true;
@@ -109,7 +109,7 @@ public class OptimizerMain {
             }
         }
 
-        // for each used variable, mark only its reaching definitions
+        // MARK - for each used variable, mark its reaching definitions
         while (!worklist.isEmpty()) {
             int i = worklist.removeFirst();
             IRInstruction inst = insts.get(i);
@@ -127,11 +127,10 @@ public class OptimizerMain {
                         }
                     }
                 }
-                // If no reaching def for v, it's param
             }
         }
 
-        // remove unmarked instructions
+        // SWEEP - rmove all unmarked & deletable instructions
         List<IRInstruction> newInsts = new ArrayList<>();
         for (int i = 0; i < n; i++) {
             if (!marked[i] && isDeletableIfUnmarked(insts.get(i))) continue;
@@ -140,8 +139,8 @@ public class OptimizerMain {
         function.instructions = newInsts;
     }
 
-    // copy propagation
-
+    // --------------------------------------------------------------------------
+    // Copy Propagation
     private static boolean copyPropagate(IRFunction f) {
         List<IRInstruction> insts = f.instructions;
         boolean anyChanged = false;
@@ -163,12 +162,13 @@ public class OptimizerMain {
 
             String dst = dstOp.getName();
             String src = srcOp.getName();
-            if (dst.equals(src)) continue;
+
+            if (dst.equals(src)) continue; // trivial copy
 
             int copyDefIdx = rdr.instDefIdx[copyIdx];
             if (copyDefIdx < 0) continue;
 
-            // collect defs reaching the copy point
+            // Find source defs that reach to the copy point
             List<Integer> srcDefList = rdr.varDefs.getOrDefault(src, Collections.emptyList());
             BitSet srcDefsAtCopy = new BitSet();
             for (int d : srcDefList) {
@@ -177,14 +177,14 @@ public class OptimizerMain {
                 }
             }
 
-            // try to propagate each inst
+            // For each instruction that uses dst, try propagate
             for (int i = 0; i < insts.size(); i++) {
                 if (i == copyIdx) continue;
                 IRInstruction inst = insts.get(i);
                 Set<String> used = getUsedVariableNames(inst);
                 if (!used.contains(dst)) continue;
 
-                // copy must be unique reaching definition of dst
+                // The copy must be the UNIQUE reaching definition of dst
                 List<Integer> dstDefList = rdr.varDefs.getOrDefault(dst, Collections.emptyList());
                 int dstDefsAtI = 0;
                 for (int d : dstDefList) {
@@ -212,6 +212,7 @@ public class OptimizerMain {
         return anyChanged;
     }
 
+    // Helper function to replace uses of old name with new name
     private static void replaceUseOfVar(IRInstruction inst, String oldName, String newName, IRType newType) {
         IRInstruction.OpCode op = inst.opCode;
         IROperand[] ops = inst.operands;
@@ -259,8 +260,7 @@ public class OptimizerMain {
         }
     }
 
-    private static void replaceAt(IRInstruction inst, IROperand[] ops, int idx,
-                                   String oldName, String newName, IRType newType) {
+    private static void replaceAt(IRInstruction inst, IROperand[] ops, int idx, String oldName, String newName, IRType newType) {
         if (idx >= ops.length) return;
         if (ops[idx] instanceof IRVariableOperand) {
             IRVariableOperand v = (IRVariableOperand) ops[idx];
@@ -270,8 +270,9 @@ public class OptimizerMain {
         }
     }
 
-    // constant folding
 
+    // --------------------------------------------------------------------------
+    // Constant Folding
     private static boolean constantFold(IRFunction f) {
         List<IRInstruction> insts = f.instructions;
         boolean anyChanged = false;
@@ -286,13 +287,8 @@ public class OptimizerMain {
             if (!(ops[1] instanceof IRConstantOperand)) continue;
             if (!(ops[2] instanceof IRConstantOperand)) continue;
 
-            boolean isBinArith = op == IRInstruction.OpCode.ADD
-                    || op == IRInstruction.OpCode.SUB
-                    || op == IRInstruction.OpCode.MULT
-                    || op == IRInstruction.OpCode.DIV
-                    || op == IRInstruction.OpCode.AND
-                    || op == IRInstruction.OpCode.OR;
-            if (!isBinArith) continue;
+            boolean simple_arithmetic = op == IRInstruction.OpCode.ADD || op == IRInstruction.OpCode.SUB || op == IRInstruction.OpCode.MULT || op == IRInstruction.OpCode.DIV || op == IRInstruction.OpCode.AND || op == IRInstruction.OpCode.OR;
+            if (!simple_arithmetic) continue;
 
             IRConstantOperand c1 = (IRConstantOperand) ops[1];
             IRConstantOperand c2 = (IRConstantOperand) ops[2];
@@ -336,8 +332,11 @@ public class OptimizerMain {
         return anyChanged;
     }
 
-    // reaching definitions computation
 
+    // --------------------------------------------------------------------------
+    // Helpers
+
+    // Helper function to reaching definitions for a list of instructions
     private static ReachingDefsResult computeReachingDefs(List<IRInstruction> insts) {
         int n = insts.size();
 
@@ -347,23 +346,23 @@ public class OptimizerMain {
         Map<String, List<Integer>> varDefs = new HashMap<>();
         List<Integer> defInstList = new ArrayList<>();
 
-        int numDefs = 0;
+        int numDef = 0;
         for (int i = 0; i < n; i++) {
             String defVar = getDefinedVar(insts.get(i));
             if (defVar != null) {
-                instDefIdx[i] = numDefs;
+                instDefIdx[i] = numDef;
                 defInstList.add(i);
-                varDefs.computeIfAbsent(defVar, k -> new ArrayList<>()).add(numDefs);
-                numDefs++;
+                varDefs.computeIfAbsent(defVar, k -> new ArrayList<>()).add(numDef);
+                numDef++;
             }
         }
 
-        int[] defInst = new int[numDefs];
-        for (int d = 0; d < numDefs; d++) {
+        int[] defInst = new int[numDef];
+        for (int d = 0; d < numDef; d++) {
             defInst[d] = defInstList.get(d);
         }
 
-        // Build CFG
+        // Build cfg and identify leaders
         boolean[] isLeader = new boolean[n];
         if (n > 0) isLeader[0] = true;
 
@@ -458,10 +457,10 @@ public class OptimizerMain {
 
         // Compute gen and kill
         for (BasicBlock bb : blocks) {
-            bb.gen  = new BitSet(numDefs);
-            bb.kill = new BitSet(numDefs);
-            bb.in   = new BitSet(numDefs);
-            bb.out  = new BitSet(numDefs);
+            bb.gen  = new BitSet(numDef);
+            bb.kill = new BitSet(numDef);
+            bb.in   = new BitSet(numDef);
+            bb.out  = new BitSet(numDef);
 
             // collect all defs in this block
             Map<String, List<Integer>> blockVarDefs = new HashMap<>();
@@ -483,7 +482,7 @@ public class OptimizerMain {
                 }
             }
 
-            // gen set
+            // GEN[B]: forward scan — last def per variable survives
             for (int i = bb.start; i <= bb.end; i++) {
                 int d = instDefIdx[i];
                 if (d < 0) continue;
@@ -497,12 +496,12 @@ public class OptimizerMain {
             }
         }
 
-        // calc in and out
+        // Iterative dataflow until fixed point
         boolean changed = true;
         while (changed) {
             changed = false;
             for (BasicBlock bb : blocks) {
-                BitSet newIn = new BitSet(numDefs);
+                BitSet newIn = new BitSet(numDef);
                 for (int predId : bb.preds) {
                     newIn.or(blocks.get(predId).out);
                 }
@@ -539,22 +538,20 @@ public class OptimizerMain {
         }
 
         for (int i = 0; i < n; i++) {
-            if (reachingDefs[i] == null) reachingDefs[i] = new BitSet(numDefs);
+            if (reachingDefs[i] == null) reachingDefs[i] = new BitSet(numDef);
         }
 
         ReachingDefsResult result = new ReachingDefsResult();
-        result.numDefs      = numDefs;
-        result.defInst      = defInst;
-        result.instDefIdx   = instDefIdx;
-        result.varDefs      = varDefs;
+        result.numDef = numDef;
+        result.defInst = defInst;
+        result.instDefIdx = instDefIdx;
+        result.varDefs = varDefs;
         result.reachingDefs = reachingDefs;
-        result.blocks       = blocks;
+        result.blocks = blocks;
         return result;
     }
 
-    // helper functions
-
-    // return name of scalar variable
+    // Helper to extract names of scalar variables defined by an instruction
     private static String getDefinedVar(IRInstruction inst) {
         IRInstruction.OpCode op = inst.opCode;
         IROperand[] ops = inst.operands;
@@ -583,9 +580,10 @@ public class OptimizerMain {
         }
     }
 
-    // check if instruction has to be kept
+    // Helper for detecting critical instructions
     private static boolean isCritical(IRInstruction inst) {
         IRInstruction.OpCode op = inst.opCode;
+
         if (op == IRInstruction.OpCode.LABEL)  return true;
         if (op == IRInstruction.OpCode.GOTO)   return true;
         if (op == IRInstruction.OpCode.BREQ)   return true;
@@ -598,13 +596,12 @@ public class OptimizerMain {
         if (op == IRInstruction.OpCode.CALLR)  return true;
         if (op == IRInstruction.OpCode.ARRAY_STORE) return true;
         if (op == IRInstruction.OpCode.ASSIGN) {
-            // three address form
             if (inst.operands != null && inst.operands.length == 3) return true;
         }
         return false;
     }
 
-    // get variable names used in instruction (read)
+    // Helper  to extract used variable names
     private static Set<String> getUsedVariableNames(IRInstruction inst) {
         Set<String> used = new HashSet<>();
         IRInstruction.OpCode op = inst.opCode;
@@ -675,7 +672,7 @@ public class OptimizerMain {
         return used;
     }
 
-    // true if can be del
+    // Helper to determine if an instruction is safe to delete when unmarked
     private static boolean isDeletableIfUnmarked(IRInstruction inst) {
         IRInstruction.OpCode op = inst.opCode;
         if (op == IRInstruction.OpCode.LABEL)  return false;
