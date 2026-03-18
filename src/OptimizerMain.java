@@ -342,7 +342,7 @@ public class OptimizerMain {
     private static ReachingDefsResult computeReachingDefs(List<IRInstruction> insts) {
         int n = insts.size();
 
-        // Step 1: Collect definitions
+        // Collect definitions
         int[] instDefIdx = new int[n];
         Arrays.fill(instDefIdx, -1);
         Map<String, List<Integer>> varDefs = new HashMap<>();
@@ -364,7 +364,7 @@ public class OptimizerMain {
             defInst[d] = defInstList.get(d);
         }
 
-        // Build CFG
+        // Build cfg and identify leaders
         boolean[] isLeader = new boolean[n];
         if (n > 0) isLeader[0] = true;
 
@@ -499,8 +499,6 @@ public class OptimizerMain {
         }
 
         // Iterative dataflow until fixed point
-        // IN[B]  = union of OUT[pred]
-        // OUT[B] = GEN[B] | (IN[B] & ~KILL[B])
         boolean changed = true;
         while (changed) {
             changed = false;
@@ -542,7 +540,6 @@ public class OptimizerMain {
             }
         }
 
-        // Fill any unset slots (shouldn't happen in a valid CFG)
         for (int i = 0; i < n; i++) {
             if (reachingDefs[i] == null) reachingDefs[i] = new BitSet(numDef);
         }
