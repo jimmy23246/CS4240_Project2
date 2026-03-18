@@ -10,7 +10,7 @@ public class OptimizerMain {
 
     public static void main(String[] args) throws Exception {
         if (args.length != 2) {
-            System.err.println("Usage: java OptimizerMain <input.ir> <output.ir>");
+            System.err.println("ERROR - must havw <input.ir> <output.ir>");
             System.exit(1);
         }
 
@@ -19,7 +19,7 @@ public class OptimizerMain {
         try {
             program = reader.parseIRFile(args[0]);
         } catch (IRException e) {
-            System.err.println("IR parse error: " + e.getMessage());
+            System.err.println("IR parse error - " + e.getMessage());
             throw e;
         }
 
@@ -245,8 +245,7 @@ public class OptimizerMain {
         }
     }
 
-    /* constant folding */
-
+    // constant folding
     private static boolean constantFold(IRFunction f) {
         List<IRInstruction> insts = f.instructions;
         boolean anyChanged = false;
@@ -312,7 +311,6 @@ public class OptimizerMain {
     }
 
     // reaching defs computation
-
     private static ReachingDefsResult computeReachingDefs(List<IRInstruction> insts) {
         int n = insts.size();
 
@@ -483,7 +481,7 @@ public class OptimizerMain {
             }
         }
 
-        // now get per-instruction reaching defs from block-level results
+        // get per-instruction reaching defs from block-level results
         BitSet[] reachingDefs = new BitSet[n];
         for (BasicBlock bb : blocks) {
             BitSet running = (BitSet) bb.in.clone();
