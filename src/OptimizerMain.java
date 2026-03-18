@@ -24,17 +24,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/**
- * Optimizer pipeline:
- *   Pass 1: Dead Code Elimination with Reaching Definitions (Optimizer B)
- *   Pass 2: Copy Propagation
- *   Pass 3: Constant Folding
- */
+// Optimizer
+// Dead Code Elimination + Copy Propagation + Constant Folding
 public class OptimizerMain {
 
     public static void main(String[] args) throws Exception {
         if (args.length != 2) {
-            System.err.println("Usage: java OptimizerMain <input.ir> <output.ir>");
+            System.err.println("Invalid arguments. Need <input.ir> <output.ir>");
             System.exit(1);
         }
 
@@ -43,11 +39,12 @@ public class OptimizerMain {
 
         IRReader reader = new IRReader();
         IRProgram program;
+        
         try {
             program = reader.parseIRFile(input);
-        } catch (IRException e) {
-            System.err.println("IR parse error: " + e.getMessage());
-            throw e;
+        } catch (IRException exception) {
+            System.err.println("IR ERROR:" + exception.getMessage());
+            throw exception;
         }
 
         for (IRFunction f : program.functions) {
@@ -60,8 +57,13 @@ public class OptimizerMain {
         }
     }
 
+<<<<<<< HEAD
     // Inner classes
 
+=======
+    // -------------------------------------------------------------------------
+    // Basic Block and Reaching Definition data structures
+>>>>>>> d65ef21 (chaning comment)
     private static class BasicBlock {
         int id, start, end;
         List<Integer> preds = new ArrayList<>();
@@ -70,14 +72,18 @@ public class OptimizerMain {
     }
 
     private static class ReachingDefsResult {
-        int numDefs;
-        int[] defInst;          // defIndex -> instruction index
-        int[] instDefIdx;       // instruction index -> defIndex (-1 if not a def)
-        Map<String, List<Integer>> varDefs; // varName -> list of defIndices
-        BitSet[] reachingDefs;  // instruction index -> BitSet of reaching defs BEFORE that instruction
+        int numDef;
+        int[] defInst;                              // defIndex -> instruction index
+        int[] instDefIdx;                           // instruction index -> defIndex (-1 if not a def)
+        Map<String, List<Integer>> varDefs;         // varName -> list of defIndices
+        BitSet[] reachingDefs;                      // instruction index -> BitSet of reaching defs BEFORE that instruction
         List<BasicBlock> blocks;
     }
 
+<<<<<<< HEAD
+=======
+    // -------------------------------------------------------------------------
+>>>>>>> d65ef21 (chaning comment)
     // Main optimization pipeline
 
     private static void optimizeFunction(IRFunction f) {
@@ -354,19 +360,19 @@ public class OptimizerMain {
         Map<String, List<Integer>> varDefs = new HashMap<>();
         List<Integer> defInstList = new ArrayList<>();
 
-        int numDefs = 0;
+        int numDef = 0;
         for (int i = 0; i < n; i++) {
             String defVar = getDefinedVar(insts.get(i));
             if (defVar != null) {
-                instDefIdx[i] = numDefs;
+                instDefIdx[i] = numDef;
                 defInstList.add(i);
-                varDefs.computeIfAbsent(defVar, k -> new ArrayList<>()).add(numDefs);
-                numDefs++;
+                varDefs.computeIfAbsent(defVar, k -> new ArrayList<>()).add(numDef);
+                numDef++;
             }
         }
 
-        int[] defInst = new int[numDefs];
-        for (int d = 0; d < numDefs; d++) {
+        int[] defInst = new int[numDef];
+        for (int d = 0; d < numDef; d++) {
             defInst[d] = defInstList.get(d);
         }
 
@@ -466,10 +472,10 @@ public class OptimizerMain {
 
         // Step 3: Compute GEN and KILL per block
         for (BasicBlock bb : blocks) {
-            bb.gen  = new BitSet(numDefs);
-            bb.kill = new BitSet(numDefs);
-            bb.in   = new BitSet(numDefs);
-            bb.out  = new BitSet(numDefs);
+            bb.gen  = new BitSet(numDef);
+            bb.kill = new BitSet(numDef);
+            bb.in   = new BitSet(numDef);
+            bb.out  = new BitSet(numDef);
 
             // Collect all defs in this block, grouped by variable
             Map<String, List<Integer>> blockVarDefs = new HashMap<>();
@@ -512,7 +518,7 @@ public class OptimizerMain {
         while (changed) {
             changed = false;
             for (BasicBlock bb : blocks) {
-                BitSet newIn = new BitSet(numDefs);
+                BitSet newIn = new BitSet(numDef);
                 for (int predId : bb.preds) {
                     newIn.or(blocks.get(predId).out);
                 }
@@ -551,11 +557,11 @@ public class OptimizerMain {
 
         // Fill any unset slots (shouldn't happen in a valid CFG)
         for (int i = 0; i < n; i++) {
-            if (reachingDefs[i] == null) reachingDefs[i] = new BitSet(numDefs);
+            if (reachingDefs[i] == null) reachingDefs[i] = new BitSet(numDef);
         }
 
         ReachingDefsResult result = new ReachingDefsResult();
-        result.numDefs      = numDefs;
+        result.numDef      = numDef;
         result.defInst      = defInst;
         result.instDefIdx   = instDefIdx;
         result.varDefs      = varDefs;
