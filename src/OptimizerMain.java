@@ -163,12 +163,13 @@ public class OptimizerMain {
 
             String dst = dstOp.getName();
             String src = srcOp.getName();
+
             if (dst.equals(src)) continue; // trivial copy
 
             int copyDefIdx = rdr.instDefIdx[copyIdx];
             if (copyDefIdx < 0) continue;
 
-            // Collect src defs reaching the copy point
+            // Find source defs that reach to the copy point
             List<Integer> srcDefList = rdr.varDefs.getOrDefault(src, Collections.emptyList());
             BitSet srcDefsAtCopy = new BitSet();
             for (int d : srcDefList) {
@@ -177,14 +178,14 @@ public class OptimizerMain {
                 }
             }
 
-            // For each instruction that uses dst, try to propagate
+            // For each instruction that uses dst, try propagate
             for (int i = 0; i < insts.size(); i++) {
                 if (i == copyIdx) continue;
                 IRInstruction inst = insts.get(i);
                 Set<String> used = getUsedVariableNames(inst);
                 if (!used.contains(dst)) continue;
 
-                // The copy must be the UNIQUE reaching definition of dst at this use
+                // The copy must be the UNIQUE reaching definition of dst
                 List<Integer> dstDefList = rdr.varDefs.getOrDefault(dst, Collections.emptyList());
                 int dstDefsAtI = 0;
                 for (int d : dstDefList) {
@@ -212,6 +213,7 @@ public class OptimizerMain {
         return anyChanged;
     }
 
+    // Helper function to replace uses of old name with new name
     private static void replaceUseOfVar(IRInstruction inst, String oldName, String newName, IRType newType) {
         IRInstruction.OpCode op = inst.opCode;
         IROperand[] ops = inst.operands;
@@ -220,21 +222,17 @@ public class OptimizerMain {
         switch (op) {
             case ASSIGN:
                 if (ops.length == 2) {
-                    // ops[0] = dst (def), ops[1] = src (use)
                     replaceAt(inst, ops, 1, oldName, newName, newType);
                 } else if (ops.length == 3) {
-                    // array write: ops[0]=array, ops[1]=idx(use), ops[2]=val(use)
                     replaceAt(inst, ops, 1, oldName, newName, newType);
                     replaceAt(inst, ops, 2, oldName, newName, newType);
                 }
                 break;
             case ADD: case SUB: case MULT: case DIV: case AND: case OR:
-                // ops[0] = dst (def), ops[1] and ops[2] = uses
                 replaceAt(inst, ops, 1, oldName, newName, newType);
                 replaceAt(inst, ops, 2, oldName, newName, newType);
                 break;
             case BREQ: case BRNEQ: case BRLT: case BRGT: case BRGEQ:
-                // ops[0] = label, ops[1] and ops[2] = uses
                 replaceAt(inst, ops, 1, oldName, newName, newType);
                 replaceAt(inst, ops, 2, oldName, newName, newType);
                 break;
@@ -242,24 +240,20 @@ public class OptimizerMain {
                 replaceAt(inst, ops, 0, oldName, newName, newType);
                 break;
             case CALL:
-                // ops[0] = func name, ops[1..] = args
                 for (int i = 1; i < ops.length; i++) {
                     replaceAt(inst, ops, i, oldName, newName, newType);
                 }
                 break;
             case CALLR:
-                // ops[0] = ret (def), ops[1] = func name, ops[2..] = args
                 for (int i = 2; i < ops.length; i++) {
                     replaceAt(inst, ops, i, oldName, newName, newType);
                 }
                 break;
             case ARRAY_STORE:
-                // array_store val, A, idx — ops[0]=val(use), ops[1]=array, ops[2]=idx(use)
                 replaceAt(inst, ops, 0, oldName, newName, newType);
                 replaceAt(inst, ops, 2, oldName, newName, newType);
                 break;
             case ARRAY_LOAD:
-                // array_load dst, A, idx — ops[0]=dst(def), ops[1]=array, ops[2]=idx(use)
                 replaceAt(inst, ops, 2, oldName, newName, newType);
                 break;
             default:
@@ -267,8 +261,7 @@ public class OptimizerMain {
         }
     }
 
-    private static void replaceAt(IRInstruction inst, IROperand[] ops, int idx,
-                                   String oldName, String newName, IRType newType) {
+    private static void replaceAt(IRInstruction inst, IROperand[] ops, int idx, String oldName, String newName, IRType newType) {
         if (idx >= ops.length) return;
         if (ops[idx] instanceof IRVariableOperand) {
             IRVariableOperand v = (IRVariableOperand) ops[idx];
@@ -278,8 +271,9 @@ public class OptimizerMain {
         }
     }
 
-    // Pass 3: Constant Folding
 
+    // --------------------------------------------------------------------------
+    // Constant Folding
     private static boolean constantFold(IRFunction f) {
         List<IRInstruction> insts = f.instructions;
         boolean anyChanged = false;
@@ -294,13 +288,8 @@ public class OptimizerMain {
             if (!(ops[1] instanceof IRConstantOperand)) continue;
             if (!(ops[2] instanceof IRConstantOperand)) continue;
 
-            boolean isBinArith = op == IRInstruction.OpCode.ADD
-                    || op == IRInstruction.OpCode.SUB
-                    || op == IRInstruction.OpCode.MULT
-                    || op == IRInstruction.OpCode.DIV
-                    || op == IRInstruction.OpCode.AND
-                    || op == IRInstruction.OpCode.OR;
-            if (!isBinArith) continue;
+            boolean simple_arithmetic = op == IRInstruction.OpCode.ADD || op == IRInstruction.OpCode.SUB || op == IRInstruction.OpCode.MULT || op == IRInstruction.OpCode.DIV || op == IRInstruction.OpCode.AND || op == IRInstruction.OpCode.OR;
+            if (!simple_arithmetic) continue;
 
             IRConstantOperand c1 = (IRConstantOperand) ops[1];
             IRConstantOperand c2 = (IRConstantOperand) ops[2];
@@ -345,8 +334,11 @@ public class OptimizerMain {
         return anyChanged;
     }
 
-    // Reaching definitions computation
 
+    // --------------------------------------------------------------------------
+    // Helpers
+
+    // Helper function to reaching definitions for a list of instructions
     private static ReachingDefsResult computeReachingDefs(List<IRInstruction> insts) {
         int n = insts.size();
 
@@ -372,8 +364,7 @@ public class OptimizerMain {
             defInst[d] = defInstList.get(d);
         }
 
-        // Step 2: Build CFG
-        // Identify leaders
+        // Build CFG
         boolean[] isLeader = new boolean[n];
         if (n > 0) isLeader[0] = true;
 
@@ -466,7 +457,7 @@ public class OptimizerMain {
             }
         }
 
-        // Step 3: Compute GEN and KILL per block
+        // Compute GEN and KILL per block
         for (BasicBlock bb : blocks) {
             bb.gen  = new BitSet(numDef);
             bb.kill = new BitSet(numDef);
@@ -507,7 +498,7 @@ public class OptimizerMain {
             }
         }
 
-        // Step 4: Iterative dataflow until fixed point
+        // Iterative dataflow until fixed point
         // IN[B]  = union of OUT[pred]
         // OUT[B] = GEN[B] | (IN[B] & ~KILL[B])
         boolean changed = true;
@@ -531,7 +522,7 @@ public class OptimizerMain {
             }
         }
 
-        // Step 5: Per-instruction reaching defs
+        // Per-instruction reaching defs
         // reachingDefs[i] = set of defs reaching BEFORE instruction i executes
         BitSet[] reachingDefs = new BitSet[n];
         for (BasicBlock bb : blocks) {
@@ -557,18 +548,16 @@ public class OptimizerMain {
         }
 
         ReachingDefsResult result = new ReachingDefsResult();
-        result.numDef      = numDef;
-        result.defInst      = defInst;
-        result.instDefIdx   = instDefIdx;
-        result.varDefs      = varDefs;
+        result.numDef = numDef;
+        result.defInst = defInst;
+        result.instDefIdx = instDefIdx;
+        result.varDefs = varDefs;
         result.reachingDefs = reachingDefs;
-        result.blocks       = blocks;
+        result.blocks = blocks;
         return result;
     }
 
-    // Helpers
-
-    /** Returns the name of the scalar variable defined by this instruction, or null. */
+    // Helper to extract names of scalar variables defined by an instruction
     private static String getDefinedVar(IRInstruction inst) {
         IRInstruction.OpCode op = inst.opCode;
         IROperand[] ops = inst.operands;
@@ -597,7 +586,7 @@ public class OptimizerMain {
         }
     }
 
-    // Helper function for detecting critical instructions
+    // Helper for detecting critical instructions
     private static boolean isCritical(IRInstruction inst) {
         IRInstruction.OpCode op = inst.opCode;
 
@@ -618,7 +607,7 @@ public class OptimizerMain {
         return false;
     }
 
-    // Helper function to extract used variable names
+    // Helper  to extract used variable names
     private static Set<String> getUsedVariableNames(IRInstruction inst) {
         Set<String> used = new HashSet<>();
         IRInstruction.OpCode op = inst.opCode;
@@ -691,7 +680,7 @@ public class OptimizerMain {
         return used;
     }
 
-    // Helper function to determine if an instruction is safe to delete when unmarked
+    // Helper to determine if an instruction is safe to delete when unmarked
     private static boolean isDeletableIfUnmarked(IRInstruction inst) {
         IRInstruction.OpCode op = inst.opCode;
         if (op == IRInstruction.OpCode.LABEL)  return false;
