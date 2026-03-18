@@ -57,13 +57,8 @@ public class OptimizerMain {
         }
     }
 
-<<<<<<< HEAD
-    // Inner classes
-
-=======
     // -------------------------------------------------------------------------
     // Basic Block and Reaching Definition data structures
->>>>>>> d65ef21 (chaning comment)
     private static class BasicBlock {
         int id, start, end;
         List<Integer> preds = new ArrayList<>();
@@ -80,23 +75,25 @@ public class OptimizerMain {
         List<BasicBlock> blocks;
     }
 
-<<<<<<< HEAD
-=======
     // -------------------------------------------------------------------------
->>>>>>> d65ef21 (chaning comment)
-    // Main optimization pipeline
-
+    // Main function w/ everything in it
     private static void optimizeFunction(IRFunction f) {
-        reachingDefsDCE(f);
+        deadcodeElimination(f);
         boolean changed = copyPropagate(f);
-        if (changed) reachingDefsDCE(f);
+        if (changed) {
+            deadcodeElimination(f);
+        }
+
         changed = constantFold(f);
-        if (changed) reachingDefsDCE(f);
+        
+        if (changed) {
+            deadcodeElimination(f);
+        }
     }
 
-    // Pass 1: Reaching Definitions DCE
-
-    private static void reachingDefsDCE(IRFunction f) {
+    // --------------------------------------------------------------------------
+    // Deadcode Elimination
+    private static void deadcodeElimination(IRFunction f) {
         List<IRInstruction> insts = f.instructions;
         int n = insts.size();
 
@@ -105,7 +102,7 @@ public class OptimizerMain {
         boolean[] marked = new boolean[n];
         ArrayDeque<Integer> worklist = new ArrayDeque<>();
 
-        // Mark all critical instructions
+        // Find critical instruction
         for (int i = 0; i < n; i++) {
             if (isCritical(insts.get(i))) {
                 marked[i] = true;
@@ -113,7 +110,7 @@ public class OptimizerMain {
             }
         }
 
-        // Mark phase: for each used variable, mark only its reaching definitions
+        // MARK - for each used variable, mark its reaching definitions
         while (!worklist.isEmpty()) {
             int i = worklist.removeFirst();
             IRInstruction inst = insts.get(i);
@@ -131,11 +128,10 @@ public class OptimizerMain {
                         }
                     }
                 }
-                // If no reaching def for v, it's a parameter — nothing to mark
             }
         }
 
-        // Sweep: remove unmarked deletable instructions
+        // SWEEP - rmove all unmarked & deletable instructions
         List<IRInstruction> newInsts = new ArrayList<>();
         for (int i = 0; i < n; i++) {
             if (!marked[i] && isDeletableIfUnmarked(insts.get(i))) continue;
@@ -144,8 +140,8 @@ public class OptimizerMain {
         f.instructions = newInsts;
     }
 
-    // Pass 2: Copy Propagation
-
+    // --------------------------------------------------------------------------
+    // Copy Propagation
     private static boolean copyPropagate(IRFunction f) {
         List<IRInstruction> insts = f.instructions;
         boolean anyChanged = false;
@@ -601,9 +597,10 @@ public class OptimizerMain {
         }
     }
 
-    /** Returns true if the instruction must always be kept (side effects / control flow). */
+    // Helper function for detecting critical instructions
     private static boolean isCritical(IRInstruction inst) {
         IRInstruction.OpCode op = inst.opCode;
+
         if (op == IRInstruction.OpCode.LABEL)  return true;
         if (op == IRInstruction.OpCode.GOTO)   return true;
         if (op == IRInstruction.OpCode.BREQ)   return true;
@@ -616,13 +613,12 @@ public class OptimizerMain {
         if (op == IRInstruction.OpCode.CALLR)  return true;
         if (op == IRInstruction.OpCode.ARRAY_STORE) return true;
         if (op == IRInstruction.OpCode.ASSIGN) {
-            // 3-operand form is an array element write — side effect
             if (inst.operands != null && inst.operands.length == 3) return true;
         }
         return false;
     }
 
-    /** Returns the set of variable names used (read) by this instruction. */
+    // Helper function to extract used variable names
     private static Set<String> getUsedVariableNames(IRInstruction inst) {
         Set<String> used = new HashSet<>();
         IRInstruction.OpCode op = inst.opCode;
@@ -695,7 +691,7 @@ public class OptimizerMain {
         return used;
     }
 
-    /** Returns true if an unmarked instruction may be safely deleted. */
+    // Helper function to determine if an instruction is safe to delete when unmarked
     private static boolean isDeletableIfUnmarked(IRInstruction inst) {
         IRInstruction.OpCode op = inst.opCode;
         if (op == IRInstruction.OpCode.LABEL)  return false;
