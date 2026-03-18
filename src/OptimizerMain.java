@@ -90,7 +90,6 @@ public class OptimizerMain {
         }
     }
 
-    // --------------------------------------------------------------------------
     // Deadcode Elimination
     private static void deadcodeElimination(IRFunction function) {
         List<IRInstruction> insts = function.instructions;
