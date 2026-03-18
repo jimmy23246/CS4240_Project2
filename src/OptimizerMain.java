@@ -60,9 +60,7 @@ public class OptimizerMain {
         }
     }
 
-    // =========================================================================
     // Inner classes
-    // =========================================================================
 
     private static class BasicBlock {
         int id, start, end;
@@ -80,9 +78,7 @@ public class OptimizerMain {
         List<BasicBlock> blocks;
     }
 
-    // =========================================================================
     // Main optimization pipeline
-    // =========================================================================
 
     private static void optimizeFunction(IRFunction f) {
         reachingDefsDCE(f);
@@ -92,9 +88,7 @@ public class OptimizerMain {
         if (changed) reachingDefsDCE(f);
     }
 
-    // =========================================================================
     // Pass 1: Reaching Definitions DCE
-    // =========================================================================
 
     private static void reachingDefsDCE(IRFunction f) {
         List<IRInstruction> insts = f.instructions;
@@ -144,9 +138,7 @@ public class OptimizerMain {
         f.instructions = newInsts;
     }
 
-    // =========================================================================
     // Pass 2: Copy Propagation
-    // =========================================================================
 
     private static boolean copyPropagate(IRFunction f) {
         List<IRInstruction> insts = f.instructions;
@@ -284,9 +276,7 @@ public class OptimizerMain {
         }
     }
 
-    // =========================================================================
     // Pass 3: Constant Folding
-    // =========================================================================
 
     private static boolean constantFold(IRFunction f) {
         List<IRInstruction> insts = f.instructions;
@@ -353,9 +343,7 @@ public class OptimizerMain {
         return anyChanged;
     }
 
-    // =========================================================================
     // Reaching definitions computation
-    // =========================================================================
 
     private static ReachingDefsResult computeReachingDefs(List<IRInstruction> insts) {
         int n = insts.size();
@@ -576,9 +564,7 @@ public class OptimizerMain {
         return result;
     }
 
-    // =========================================================================
     // Helpers
-    // =========================================================================
 
     /** Returns the name of the scalar variable defined by this instruction, or null. */
     private static String getDefinedVar(IRInstruction inst) {
