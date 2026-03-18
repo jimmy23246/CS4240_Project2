@@ -48,7 +48,7 @@ public class OptimizerMain {
         }
 
         for (IRFunction f : program.functions) {
-            optimizeFunction(f);
+            optimizer(f);
         }
 
         try (PrintStream ps = new PrintStream(new FileOutputStream(output))) {
@@ -77,24 +77,24 @@ public class OptimizerMain {
 
     // -------------------------------------------------------------------------
     // Main function w/ everything in it
-    private static void optimizeFunction(IRFunction f) {
-        deadcodeElimination(f);
-        boolean changed = copyPropagate(f);
+    private static void optimizer(IRFunction function) {
+        deadcodeElimination(function);
+        boolean changed = copyPropagate(function);
         if (changed) {
-            deadcodeElimination(f);
+            deadcodeElimination(function);
         }
 
-        changed = constantFold(f);
+        changed = constantFold(function);
         
         if (changed) {
-            deadcodeElimination(f);
+            deadcodeElimination(function);
         }
     }
 
     // --------------------------------------------------------------------------
     // Deadcode Elimination
-    private static void deadcodeElimination(IRFunction f) {
-        List<IRInstruction> insts = f.instructions;
+    private static void deadcodeElimination(IRFunction function) {
+        List<IRInstruction> insts = function.instructions;
         int n = insts.size();
 
         ReachingDefsResult rdr = computeReachingDefs(insts);
@@ -137,7 +137,7 @@ public class OptimizerMain {
             if (!marked[i] && isDeletableIfUnmarked(insts.get(i))) continue;
             newInsts.add(insts.get(i));
         }
-        f.instructions = newInsts;
+        function.instructions = newInsts;
     }
 
     // --------------------------------------------------------------------------
@@ -656,7 +656,6 @@ public class OptimizerMain {
                 }
                 break;
             case ARRAY_STORE:
-                // array_store val, A, idx — uses val and idx
                 if (ops.length >= 3) {
                     if (ops[0] instanceof IRVariableOperand)
                         used.add(((IRVariableOperand) ops[0]).getName());
@@ -665,7 +664,6 @@ public class OptimizerMain {
                 }
                 break;
             case ARRAY_LOAD:
-                // array_load dst, A, idx — uses idx only
                 if (ops.length >= 3) {
                     if (ops[2] instanceof IRVariableOperand)
                         used.add(((IRVariableOperand) ops[2]).getName());
