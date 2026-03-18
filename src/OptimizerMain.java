@@ -10,7 +10,6 @@ import ir.datatype.IRType;
 import ir.operand.IRConstantOperand;
 import ir.operand.IROperand;
 import ir.operand.IRVariableOperand;
-
 import java.io.FileOutputStream;
 import java.io.PrintStream;
 import java.util.ArrayDeque;
@@ -27,7 +26,6 @@ import java.util.Set;
 // Optimizer
 // Dead Code Elimination + Copy Propagation + Constant Folding
 public class OptimizerMain {
-
     public static void main(String[] args) throws Exception {
         if (args.length != 2) {
             System.err.println("Invalid arguments. Need <input.ir> <output.ir>");
@@ -57,7 +55,6 @@ public class OptimizerMain {
         }
     }
 
-    // -------------------------------------------------------------------------
     // Basic Block and Reaching Definition data structures
     private static class BasicBlock {
         int id, start, end;
@@ -98,7 +95,8 @@ public class OptimizerMain {
         ReachingDefsResult rdr = computeReachingDefs(insts);
 
         boolean[] marked = new boolean[n];
-        ArrayDeque<Integer> worklist = new ArrayDeque<>();
+        ArrayDeque<Integer> worklist = new ArrayDeque<>();    // Deadcode Elimination
+
 
         // Find critical instruction
         for (int i = 0; i < n; i++) {
@@ -129,7 +127,7 @@ public class OptimizerMain {
             }
         }
 
-        // SWEEP - rmove all unmarked & deletable instructions
+        // SWEEP - remove all unmarked & deletable instructions
         List<IRInstruction> newInsts = new ArrayList<>();
         for (int i = 0; i < n; i++) {
             if (!marked[i] && isDeletableIfUnmarked(insts.get(i))) continue;
